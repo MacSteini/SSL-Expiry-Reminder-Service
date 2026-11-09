@@ -33,7 +33,7 @@
 # A daily scan discovers expiring certificates and reconciles timers.
 # Each enabled domain has its own transient follow-up timer and a saved
 # certificate fingerprint, so unrelated scans do not resend its warning.
-# See the README for installation, state, upgrade, and recovery details.
+# See the README for installation, state, replacement, and recovery details.
 
 # MIT Licence:
 # Copyright (c) 2025 MacSteini

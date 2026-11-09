@@ -35,7 +35,7 @@ This script automates the monitoring of SSL certificates by checking their expir
 	- `systemd` (`systemd-run`, `systemctl`, and `systemd-analyze`)
 	- `flock` (util-linux), GNU coreutils (`sha256sum`, `stat`, `realpath`, `date`, and `mktemp`), and `sed`
 
-`systemd-analyze timespan` is required for regular follow-up intervals. It is available in upstream systemd 240 and later, or in older distribution versions that backport it. Check with `systemd-analyze timespan 24h` before upgrading; without it, regular follow-ups cannot be scheduled.
+`systemd-analyze timespan` is required for regular follow-up intervals. Check support with `systemd-analyze timespan 24h`; without it, regular follow-ups cannot be scheduled.
 
 ## Installation
 
@@ -137,9 +137,9 @@ systemctl list-timers --all 'ssl-expiry-followup-*'
 sudo journalctl -u 'ssl-expiry-followup-*'
 ```
 
-### Upgrade and stopping reminders
+### Replacing the script and stopping reminders
 
-Before replacing the script, save your email addresses, warning thresholds and follow-up intervals. Copy them into the new script after upgrading. Check its ownership and permissions as described under Installation.
+Before replacing the script, save your email addresses, warning thresholds and follow-up intervals. Copy them into the replacement and check its ownership and permissions as described under Installation.
 
 If you choose to move the script, install the new copy at the chosen location and update the service's `ExecStart` path. Follow-up timers use the resolved path of the script at the time they are created, even if it was started through a symbolic link. Existing timers therefore still point to the old file if you move it or change the link. Keep the old copy in place until you have recreated them:
 
