@@ -13,7 +13,7 @@ A Bash script that checks local SSL certificate expiry dates and emails reminder
 - [Licence](#licence)
 
 ## Overview
-My main motivation for publishing these few lines of code was the recent [announcement by Let’s Encrypt](https://letsencrypt.org/2025/01/22/ending-expiration-emails/ "Ending Support for Expiration Notification Emails (Let’s Encrypt)") about ending notification emails for domain expiry.
+My main motivation for publishing these few lines of code was the [announcement by Let’s Encrypt](https://letsencrypt.org/2025/01/22/ending-expiration-emails/ "Ending Support for Expiration Notification Emails (Let’s Encrypt)") about ending notification emails for domain expiry.
 
 I don’t expect an uproar, but if there is one – this repo is here to ease your pain… ;-)
 
