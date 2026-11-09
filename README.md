@@ -82,6 +82,12 @@ The service runs with administrator privileges. Anyone who can modify or replace
 	```sh
 	sudo systemctl daemon-reload && sudo systemctl enable SSL-Expiry.timer && sudo systemctl start SSL-Expiry.timer
 	```
+1. Run an initial scan and check its result:
+	```sh
+	sudo systemctl start SSL-Expiry.service
+	systemctl show SSL-Expiry.service --property=Result --value
+	```
+	Check the journal for errors. A scan only sends mail for certificates within their warning period; independently verify that your mail system can deliver messages to the configured recipients.
 
 ## Configuration
 Edit the `/usr/local/bin/SSL_Expiry_Reminder.sh` script to customise the following settings:
@@ -103,7 +109,7 @@ configure_domains "Domain Admin <team@example.com>" 10 "11h" \
     example.com www.example.com shop.example.com
 ```
 
-The arguments are the additional recipient, the warning threshold in **days**, the follow-up interval, and one or more certificate names. Each name refers to a certificate directory, not necessarily every domain covered by that certificate. All names in the group share those settings. The master recipient still receives the warning. Use `""` for no additional recipient, or for the default warning threshold. Domains not listed use the master settings. If a domain appears in multiple groups, the last group takes precedence.
+The arguments are the additional recipient, the warning threshold in **days**, the follow-up interval, and one or more certificate names. Warning thresholds must be non-negative whole numbers of at most nine digits. Each name refers to a certificate directory, not necessarily every domain covered by that certificate. All names in the group share those settings. The master recipient still receives the warning. Use `""` for no additional recipient, or for the default warning threshold. Domains not listed use the master settings. If a domain appears in multiple groups, the last group takes precedence.
 
 Follow-up intervals use systemd time spans: for example, `"30min"`, `"11h"`, `"1d"`, `"2w"`, `"1y"`, or `"1h30m"`. A year is a fixed duration of 365.25 days, not a calendar anniversary. Intervals must be positive and less than one billion seconds (about 31.7 years); fractions of a second are rounded up. An empty interval disables follow-ups for that group, even if the master interval is set. If the master interval is empty, groups with a non-empty interval still receive follow-ups. Failed initial warnings are retried even when follow-ups are disabled.
 
@@ -150,7 +156,7 @@ To disable follow-ups, set the master interval and any group intervals to empty 
 
 ## Troubleshooting
 
-If scheduling or mail submission fails, the script exits unsuccessfully and reports the affected domain. Check the service journal and correct the problem. A later daily or manual scan recovers missing timers or processes overdue reminders. If submission succeeds for some recipients but fails for others, a retry may repeat mail to the successful recipients. A crash after mail is accepted but before the state is saved can also lead to a repeated warning.
+If the certificate directory is missing or inaccessible, the script exits unsuccessfully without removing reminder state or cancelling timers. A missing or inaccessible `fullchain.pem` in an existing certificate directory is also reported as an error and its reminder state is preserved. Restore access and run another scan. Scheduling and mail submission failures also cause an unsuccessful exit and report the affected domain. Check the service journal and correct the problem. A later daily or manual scan recovers missing timers or processes overdue reminders. If submission succeeds for some recipients but fails for others, a retry may repeat mail to the successful recipients. A crash after mail is accepted but before the state is saved can also lead to a repeated warning.
 
 ## Contributing
 Contributions are welcome! Please follow these steps:

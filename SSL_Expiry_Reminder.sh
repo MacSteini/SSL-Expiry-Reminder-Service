@@ -36,6 +36,8 @@
 # See the README for installation, state, upgrade, and recovery details.
 
 # MIT Licence:
+# Copyright (c) 2025 MacSteini
+#
 # Permission is hereby granted, free of charge, to any person obtaining
 # a copy of this software and associated documentation files (the
 # "Software"), to deal in the Software without restriction, including
@@ -156,6 +158,13 @@ if [ "$#" -ne 0 ]; then
     REQUEST_UNIT=$3
 fi
 
+# Do not interpret an inaccessible certificate store as removed certificates.
+# In particular, preserve reminder state and timers until the store is back.
+if [ ! -d "$CERT_DIR" ] || [ ! -r "$CERT_DIR" ] || [ ! -x "$CERT_DIR" ]; then
+    echo "Certificate directory is missing or inaccessible: $CERT_DIR" >&2
+    exit 1
+fi
+
 # State: fingerprint, interval, pending unit, domain, due epoch, retry stage.
 # The unit name is a token as well: stale timer invocations cannot send mail.
 write_state() {
@@ -257,6 +266,10 @@ process_domain() {
         return 0
     fi
     if [ ! -f "$CERT_DIR/$DOMAIN/fullchain.pem" ]; then
+        if [ -e "$CERT_DIR/$DOMAIN" ] || [ -L "$CERT_DIR/$DOMAIN" ]; then
+            echo "Certificate file is missing or inaccessible for $DOMAIN" >&2
+            return 1
+        fi
         cancel_timer || return 1
         [ ! -f "$STATE_FILE" ] || rm -f "$STATE_FILE" || return 1
         return 0
@@ -273,7 +286,11 @@ process_domain() {
     CURRENT_TIMESTAMP=$(date +%s) || return 1
     DAYS_LEFT=$(((EXPIRY_TIMESTAMP - CURRENT_TIMESTAMP) / 86400))
     DOMAIN_WARNING_DAYS=${WARNING_DAYS[$DOMAIN]:-$MASTER_WARNING_DAYS}
-    if [ "$DAYS_LEFT" -gt "$DOMAIN_WARNING_DAYS" ]; then
+    case "$DOMAIN_WARNING_DAYS" in
+        ''|*[!0-9]*|??????????*) echo "Invalid warning threshold for $DOMAIN: $DOMAIN_WARNING_DAYS" >&2; return 1 ;;
+    esac
+    DOMAIN_WARNING_DAYS=$((10#$DOMAIN_WARNING_DAYS))
+    if [ "$((EXPIRY_TIMESTAMP - CURRENT_TIMESTAMP))" -gt "$((DOMAIN_WARNING_DAYS * 86400))" ]; then
         cancel_timer || return 1
         [ ! -f "$STATE_FILE" ] || rm -f "$STATE_FILE" || return 1
         return 0
@@ -351,12 +368,12 @@ else
     for STATE_FILE in "$STATE_DIR"/[0-9a-f]*; do
         [ -f "$STATE_FILE" ] || continue
         { IFS= read -r _ && IFS= read -r _ && IFS= read -r _ && IFS= read -r DOMAIN; } < "$STATE_FILE" || { echo "Invalid state: $STATE_FILE" >&2; STATUS=1; continue; }
-        if [ ! -f "$CERT_DIR/$DOMAIN/fullchain.pem" ]; then
+        if [ ! -e "$CERT_DIR/$DOMAIN" ] && [ ! -L "$CERT_DIR/$DOMAIN" ]; then
             process_domain "$DOMAIN" || STATUS=1
         fi
     done
     for DOMAIN_PATH in "$CERT_DIR"/*; do
-        [ -f "$DOMAIN_PATH/fullchain.pem" ] || continue
+        [ -d "$DOMAIN_PATH" ] || [ -L "$DOMAIN_PATH" ] || continue
         process_domain "${DOMAIN_PATH##*/}" || STATUS=1
     done
 fi
