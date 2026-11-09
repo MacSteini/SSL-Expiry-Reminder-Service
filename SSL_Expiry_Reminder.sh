@@ -16,7 +16,7 @@
 # - Sends reminders to a master admin email for all domains.
 # - Supports additional email recipients per domain.
 # - Uses a default expiry warning threshold, but allows per-domain
-#   settings.
+# settings.
 # - Configurable follow-up intervals to send repeated reminders.
 # - Uses the systemd-run command to schedule follow-up reminders.
 #
@@ -26,81 +26,13 @@
 # - Define per-domain custom settings (optional).
 # - Ensure sendmail (or another MTA) is configured to send emails.
 #
-# ======================================================================
-# Follow-up Reminder Interval Configuration
-# ======================================================================
-# This setting defines how often follow-up emails should be sent after
-# the first warning. If a certificate is near expiry, the script sends a
-# warning email and schedules itself to run again after the defined time
-# interval (using systemd-run).
-#
-# The follow-up process will continue indefinitely (at the specified
-# interval) until:
-# 1. The SSL certificate is renewed (the script detects a new expiry
-#    date).
-# 2. The server admin manually disables follow-ups (by setting this
-#    value to "").
-#
-# Affected Variables:
-# -------------------
-# - MASTER_FOLLOW_UP_INTERVAL: Controls the global follow-up schedule
-#   (default for all domains).
-# - FOLLOW_UP_INTERVALS["yourdomain.com"]: Overrides the global setting
-#   for a specific domain.
-# - FOLLOW_UP_REQUIRED: DO NOT MODIFY! This flag determines whether a
-#   follow-up is needed.
-# - systemd-run --on-active=$FOLLOW_UP_INTERVAL: Used to schedule the
-#   next execution.
-#   - If FOLLOW_UP_INTERVALS["yourdomain.com"] exists, it will replace
-#     MASTER_FOLLOW_UP_INTERVAL when scheduling follow-ups for that
-#     domain.
-#
-# How Follow-Ups are Scheduled:
-# -----------------------------
-# - If a domain has no custom interval, follow-ups use
-#   MASTER_FOLLOW_UP_INTERVAL.
-# - If FOLLOW_UP_INTERVALS["yourdomain.com"] is set, that domain follows
-#   its own schedule.
-# - If MASTER_FOLLOW_UP_INTERVAL="", and a domain has no override, no
-#   follow-ups are scheduled.
-#
-# Accepted Formats:
-# -----------------
-# - "24h"   Every 24 hours (daily follow-ups, recommended default).
-# - "12h"   Every 12 hours (twice a day).
-# - "48h"   Every 48 hours (every 2 days).
-# - "7d"    Every 7 days (weekly follow-ups).
-# - "1h30m" Every 1 hour and 30 minutes.
-# - "2d3h"  Every 2 days and 3 hours.
-# - "10m"   Every 10 minutes.
-# - ""      Disables follow-ups (only one initial warning is sent).
-#
-# Usage Scenarios:
-# -----------------
-# - If you want daily reminders for all domains, use:
-#   MASTER_FOLLOW_UP_INTERVAL="24h"
-# - If you want different schedules per domain, define:
-#   FOLLOW_UP_INTERVALS["yourdomain1.com"]="11h"
-#   FOLLOW_UP_INTERVALS["yourdomain2.com"]="48h"
-#   FOLLOW_UP_INTERVALS["yourdomain3.com"]="8h"
-#   …and so on
-# - If you want to test the script without waiting too long, use:
-#   MASTER_FOLLOW_UP_INTERVAL="5m"
-# - If you do not want follow-up emails globally, use
-#   MASTER_FOLLOW_UP_INTERVAL=""
-#   Disables follow-ups unless overridden per domain.
-# - If you want to disable follow-ups for only one domain, use:
-#   FOLLOW_UP_INTERVALS["yourdomain.com"]=""
-#   This domain gets only one email.
-#
-# ⚠️ Warning ⚠️
-# -----------
-# - Setting a very short interval (e. g., "10m") may cause excessive
-#   emails.
-# - Systemd will continue rescheduling the script until the certificate
-#   is renewed.
-# - If emails become too frequent, either increase the interval or
-#   disable follow-ups.
+# Follow-up intervals use systemd time spans, for example "24h", "11h",
+# or "1h30m". An empty master interval disables follow-ups by default;
+# an explicitly empty domain override disables them for that domain.
+# A daily scan discovers expiring certificates and reconciles timers.
+# Each enabled domain has its own transient follow-up timer and a saved
+# certificate fingerprint, so unrelated scans do not resend its warning.
+# See the README for installation, state, upgrade, and recovery details.
 #
 # MIT Licence:
 # Permission is hereby granted, free of charge, to any person obtaining
@@ -155,63 +87,165 @@ FOLLOW_UP_INTERVALS["yourdomain2.com"]="24h"
 #
 # The following section is part of the script's internal logic.
 # - DO NOT change any variables here unless you fully understand the
-#   implications.
+# implications.
 # - Modifying these values incorrectly may break the script or cause
-#   incorrect behaviour.
+# incorrect behaviour.
 # - The script will handle follow-ups and expiry checks automatically.
 #
 # If you need to change settings, do so in the CONFIGURATION section at
 # the top of the script.
 
-# Flag to determine if any follow-up reminders should be scheduled
-FOLLOW_UP_REQUIRED=0
+# A root-only state directory and a single lock coordinate the daily scan,
+# manual runs, and transient follow-up services.
+STATE_DIR=/var/lib/ssl-expiry-reminder
+CERT_DIR=/etc/letsencrypt/live
+SCRIPT_PATH=/usr/local/bin/SSL_Expiry_Reminder.sh
+umask 077
+mkdir -p "$STATE_DIR" || exit 1
+exec 9>"$STATE_DIR/lock" || exit 1
+flock -x 9 || exit 1
 
-for DOMAIN_PATH in /etc/letsencrypt/live/*; do
-DOMAIN=$(basename "$DOMAIN_PATH") # Extract the domain name from the directory path
-
-# Skip domains that do not have a certificate file
-if [ ! -f "$DOMAIN_PATH/fullchain.pem" ]; then
-continue
+MODE=scan
+if [ "$#" -ne 0 ]; then
+    if [ "$#" -ne 3 ] || [ "$1" != "--follow-up" ]; then
+        echo "Usage: $0 [--follow-up DOMAIN UNIT]" >&2
+        exit 2
+    fi
+    MODE=follow-up
+    REQUEST_DOMAIN=$2
+    REQUEST_UNIT=$3
 fi
 
-# Retrieve the certificate expiry date
-EXPIRY_DATE=$(openssl x509 -enddate -noout -in "$DOMAIN_PATH/fullchain.pem" | cut -d= -f2)
-EXPIRY_TIMESTAMP=$(date -d "$EXPIRY_DATE" +%s) # Convert expiry date to a timestamp
-CURRENT_TIMESTAMP=$(date +%s) # Get the current timestamp
-DAYS_LEFT=$(((EXPIRY_TIMESTAMP - CURRENT_TIMESTAMP) / 86400)) # Calculate days until expiry
+# State is four lines: fingerprint, configured interval, pending unit, domain.
+# The unit name is a token as well: stale timer invocations cannot send mail.
+write_state() {
+    local tmp
+    tmp=$(mktemp "$STATE_DIR/state.XXXXXXXXXX") || return 1
+    if ! printf '%s\n' "$FINGERPRINT" "$INTERVAL" "$UNIT" "$DOMAIN" > "$tmp" || ! mv -f "$tmp" "$STATE_FILE"; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
 
-# Determine the warning threshold (use domain-specific setting if
-# available, otherwise use the master setting)
-DOMAIN_WARNING_DAYS=${WARNING_DAYS[$DOMAIN]:-$MASTER_WARNING_DAYS}
+cancel_timer() {
+    if [ -n "$UNIT" ] && systemctl is-active --quiet "$UNIT.timer"; then
+        systemctl stop "$UNIT.timer" || return 1
+    fi
+    UNIT=
+}
 
-# If the certificate is expiring within the warning period,
-# send a reminder
-if [ "$DAYS_LEFT" -le "$DOMAIN_WARNING_DAYS" ]; then
+schedule_timer() {
+    local token_file token new_unit
+    [ -n "$INTERVAL" ] || return 0
+    token_file=$(mktemp "$STATE_DIR/timer.XXXXXXXXXX") || return 1
+    token=${token_file##*.}
+    rm -f "$token_file" || return 1
+    new_unit="ssl-expiry-followup-$DOMAIN_HASH-$token"
+    # Persist the token before creating the timer. A failed creation is
+    # retried by the next scan; a stale callback cannot match a new token.
+    UNIT=$new_unit
+    write_state || return 1
+    if ! systemd-run --on-active="$INTERVAL" --unit="$UNIT" "$SCRIPT_PATH" --follow-up "$DOMAIN" "$UNIT"; then
+        echo "Failed to schedule follow-up for $DOMAIN" >&2
+        UNIT=
+        write_state || return 1
+        return 1
+    fi
+}
 
-# Always include the master email recipient first…
-RECIPIENTS=("$MASTER_EMAIL")
+process_domain() {
+    local DOMAIN=$1 DOMAIN_HASH STATE_FILE CERT_INFO EXPIRY_DATE EXPIRY_TIMESTAMP
+    local CURRENT_TIMESTAMP DAYS_LEFT DOMAIN_WARNING_DAYS NEW_FINGERPRINT
+    local FINGERPRINT='' INTERVAL='' UNIT='' SAVED_DOMAIN='' OLD_INTERVAL='' EMAIL
+    local -a RECIPIENTS
+    case "$DOMAIN" in
+        ''|*[!a-zA-Z0-9._-]*|.|..) echo "Invalid domain directory: $DOMAIN" >&2; return 1 ;;
+    esac
+    DOMAIN_HASH=$(printf '%s' "$DOMAIN" | sha256sum) || return 1
+    DOMAIN_HASH=${DOMAIN_HASH%% *}
+    STATE_FILE="$STATE_DIR/$DOMAIN_HASH"
+    if [ -f "$STATE_FILE" ]; then
+        { IFS= read -r FINGERPRINT && IFS= read -r OLD_INTERVAL && IFS= read -r UNIT && IFS= read -r SAVED_DOMAIN; } < "$STATE_FILE" || {
+            echo "Invalid state for $DOMAIN" >&2; return 1;
+        }
+        [ "$SAVED_DOMAIN" = "$DOMAIN" ] || { echo "State mismatch for $DOMAIN" >&2; return 1; }
+    fi
+    # An explicitly empty override differs from an absent array entry.
+    INTERVAL=${FOLLOW_UP_INTERVALS[$DOMAIN]-$MASTER_FOLLOW_UP_INTERVAL}
+    if [ "$MODE" = follow-up ] && [ "$REQUEST_UNIT" != "$UNIT" ]; then
+        return 0
+    fi
+    if [ ! -f "$CERT_DIR/$DOMAIN/fullchain.pem" ]; then
+        cancel_timer || return 1
+        [ ! -f "$STATE_FILE" ] || rm -f "$STATE_FILE" || return 1
+        return 0
+    fi
+    CERT_INFO=$(openssl x509 -enddate -fingerprint -sha256 -noout -in "$CERT_DIR/$DOMAIN/fullchain.pem") || {
+        echo "Cannot read certificate for $DOMAIN" >&2; return 1;
+    }
+    EXPIRY_DATE=$(printf '%s\n' "$CERT_INFO" | sed -n 's/^notAfter=//p')
+    NEW_FINGERPRINT=$(printf '%s\n' "$CERT_INFO" | sed -n 's/^[^=]*[Ff]ingerprint=//p')
+    if [ -z "$EXPIRY_DATE" ] || [ -z "$NEW_FINGERPRINT" ]; then
+        echo "Incomplete certificate information for $DOMAIN" >&2; return 1
+    fi
+    EXPIRY_TIMESTAMP=$(date -d "$EXPIRY_DATE" +%s) || return 1
+    CURRENT_TIMESTAMP=$(date +%s) || return 1
+    DAYS_LEFT=$(((EXPIRY_TIMESTAMP - CURRENT_TIMESTAMP) / 86400))
+    DOMAIN_WARNING_DAYS=${WARNING_DAYS[$DOMAIN]:-$MASTER_WARNING_DAYS}
+    if [ "$DAYS_LEFT" -gt "$DOMAIN_WARNING_DAYS" ]; then
+        cancel_timer || return 1
+        [ ! -f "$STATE_FILE" ] || rm -f "$STATE_FILE" || return 1
+        return 0
+    fi
+    if [ "$FINGERPRINT" != "$NEW_FINGERPRINT" ]; then
+        cancel_timer || return 1
+        FINGERPRINT=
+    elif [ "$OLD_INTERVAL" != "$INTERVAL" ]; then
+        cancel_timer || return 1
+        write_state || return 1
+        # A callback for a newly disabled or changed interval is stale.
+        [ "$MODE" != follow-up ] || { schedule_timer; return $?; }
+    fi
+    if [ -z "$FINGERPRINT" ] || [ "$MODE" = follow-up ]; then
+        RECIPIENTS=("$MASTER_EMAIL")
+        if [ -n "${EMAILS[$DOMAIN]}" ] && [ "${EMAILS[$DOMAIN]}" != "$MASTER_EMAIL" ]; then
+            RECIPIENTS+=("${EMAILS[$DOMAIN]}")
+        fi
+        for EMAIL in "${RECIPIENTS[@]}"; do
+            if ! printf 'From: %s\nTo: %s\nSubject: SSL Certificate Expiry Warning for %s\n\nThe SSL certificate for %s expires in %s days.\n\nConsider renewing it soon to avoid downtime.\n' "$SENDER_EMAIL" "$EMAIL" "$DOMAIN" "$DOMAIN" "$DAYS_LEFT" | sendmail -t; then
+                echo "Failed to send warning for $DOMAIN" >&2
+                return 1
+            fi
+        done
+        FINGERPRINT=$NEW_FINGERPRINT
+        UNIT=
+        write_state || return 1
+    fi
+    if [ -n "$INTERVAL" ]; then
+        if [ -z "$UNIT" ] || ! systemctl is-active --quiet "$UNIT.timer"; then
+            schedule_timer || return 1
+        fi
+    elif [ -n "$UNIT" ]; then
+        cancel_timer || return 1
+        write_state || return 1
+    fi
+}
 
-# …and add domain-specific recipients if specified
-if [ -n "${EMAILS[$DOMAIN]}" ]; then
-RECIPIENTS+=("${EMAILS[$DOMAIN]}")
+STATUS=0
+if [ "$MODE" = follow-up ]; then
+    process_domain "$REQUEST_DOMAIN" || STATUS=1
+else
+    # Also reconcile stored domains whose certificate has been removed.
+    for STATE_FILE in "$STATE_DIR"/[0-9a-f]*; do
+        [ -f "$STATE_FILE" ] || continue
+        { IFS= read -r _ && IFS= read -r _ && IFS= read -r _ && IFS= read -r DOMAIN; } < "$STATE_FILE" || { echo "Invalid state: $STATE_FILE" >&2; STATUS=1; continue; }
+        if [ ! -f "$CERT_DIR/$DOMAIN/fullchain.pem" ]; then
+            process_domain "$DOMAIN" || STATUS=1
+        fi
+    done
+    for DOMAIN_PATH in "$CERT_DIR"/*; do
+        [ -f "$DOMAIN_PATH/fullchain.pem" ] || continue
+        process_domain "${DOMAIN_PATH##*/}" || STATUS=1
+    done
 fi
-
-# Construct the email subject and body
-SUBJECT="SSL Certificate Expiry Warning for $DOMAIN"
-MESSAGE="The SSL certificate for $DOMAIN expires in $DAYS_LEFT days.\n\nConsider renewing it soon to avoid downtime…"
-
-# Send individual emails to each recipient
-for EMAIL in "${RECIPIENTS[@]}"; do
-echo -e "From: $SENDER_EMAIL\nTo: $EMAIL\nSubject: $SUBJECT\n\n$MESSAGE" | sendmail -t
-done
-
-# Indicate that follow-up reminders should be scheduled
-FOLLOW_UP_REQUIRED=1
-fi
-done
-
-# If any certificates are due for renewal, reschedule the script to run again
-# after the defined follow-up interval
-if [ "$FOLLOW_UP_REQUIRED" -eq 1 ]; then
-systemd-run --on-active="$MASTER_FOLLOW_UP_INTERVAL" --unit=ssl-expiry-followup /usr/local/bin/SSL_Expiry_Reminder.sh
-fi
+exit "$STATUS"
