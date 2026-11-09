@@ -59,6 +59,7 @@ MASTER_EMAIL="Domain Admin <admin@example.com>" # Primary email to receive all e
 MASTER_WARNING_DAYS=14 # Default number of days before expiry to trigger a reminder
 MASTER_FOLLOW_UP_INTERVAL="24h" # Default interval for follow-up reminders (e. g., "24h" for daily)
 SENDER_EMAIL="Let’s Encrypt SSL Expiry Service <noreply@example.com>" # Sender email address for reminders
+SCRIPT_PATH="/usr/local/bin/SSL_Expiry_Reminder.sh" # Absolute path to this script, used for scheduled reminders
 
 # ----------------------------------------------------------------------
 # Per-Domain Custom Settings (Optional)
@@ -99,7 +100,6 @@ FOLLOW_UP_INTERVALS["yourdomain2.com"]="24h"
 # manual runs, and transient follow-up services.
 STATE_DIR=/var/lib/ssl-expiry-reminder
 CERT_DIR=/etc/letsencrypt/live
-SCRIPT_PATH=/usr/local/bin/SSL_Expiry_Reminder.sh
 umask 077
 mkdir -p "$STATE_DIR" || exit 1
 exec 9>"$STATE_DIR/lock" || exit 1

@@ -39,6 +39,8 @@ This script automates the monitoring of SSL certificates by checking their expir
 
 ## Installation
 
+The paths below use `/usr/local/bin/SSL_Expiry_Reminder.sh` as an example. If you choose another location, use its absolute path throughout the installation and set `SCRIPT_PATH` in the script to the same path. The systemd service's `ExecStart` must point to that file as well.
+
 1. Download the Script:
 	- Save the script as `/usr/local/bin/SSL_Expiry_Reminder.sh`
 1. Make the Script Executable:
@@ -84,6 +86,7 @@ Edit the `/usr/local/bin/SSL_Expiry_Reminder.sh` script to customise the followi
 	- `MASTER_WARNING_DAYS`: Default number of days before expiry to trigger a reminder.
 	- `MASTER_FOLLOW_UP_INTERVAL`: Default interval for follow-up reminders (e. g., “24h” for daily).
 	- `SENDER_EMAIL`: Sender email address for reminders.
+	- `SCRIPT_PATH`: Absolute path to the installed script; scheduled reminders use this path. It must match the service's `ExecStart` path.
 - Per-Domain Custom Settings (Optional):
 	- `EMAILS["yourdomain.com"]`: Additional email recipients for specific domains.
 	- `WARNING_DAYS["yourdomain.com"]`: Custom warning thresholds for specific domains.
