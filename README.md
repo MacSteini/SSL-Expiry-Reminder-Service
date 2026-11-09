@@ -9,7 +9,6 @@ A Bash script that monitors SSL certificate expiry dates and sends email notific
 - [Configuration](#configuration)
 - [Usage](#usage)
 - [Troubleshooting](#troubleshooting)
-- [Tests](#tests)
 - [Contributing](#contributing)
 - [Licence](#licence)
 
@@ -126,14 +125,6 @@ If the old timer is absent, systemd may report that it could not be found. The n
 ## Troubleshooting
 
 If scheduling or mail delivery fails, the script exits unsuccessfully and reports the affected domain. Check the service journal and correct the problem. A later daily or manual scan retries missing timers; failed mail delivery may need another scan. If delivery succeeds for some recipients but fails for others, a retry may repeat mail to the successful recipients. A crash after mail is accepted but before the state is saved can also lead to a repeated warning.
-
-## Tests
-
-The isolated tests use Python 3.9 or later and Bash 4 or later. They create synthetic certificate data in a temporary directory and replace mail, systemd, OpenSSL, clock, and locking commands with test doubles. Run them from the repository root:
-
-```sh
-python3 -m unittest discover -s tests -v
-```
 
 ## Contributing
 Contributions are welcome! Please follow these steps:
