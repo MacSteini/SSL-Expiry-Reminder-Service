@@ -1,5 +1,5 @@
 # Let’s Encrypt SSL Certificate Expiry Reminder Service
-A Bash script that monitors SSL certificate expiry dates and sends email notifications to designated recipients, ensuring timely renewals and uninterrupted secure connections.
+A Bash script that checks local SSL certificate expiry dates and emails reminders to designated recipients.
 ## Table of Contents
 
 - [Overview](#overview)
@@ -20,7 +20,7 @@ I don’t expect an uproar, but if there is one – this repo is here to ease yo
 This script automates the monitoring of SSL certificates by checking their expiry dates and sending email alerts to specified recipients when certificates are nearing expiry. It supports both global and per-domain configurations, allowing for flexible management across multiple domains.
 ## Features
 
-- **Automated Monitoring**: Periodically checks SSL certificate expiry dates for all domains managed by Let’s Encrypt on the server.
+- **Automated Monitoring**: Periodically checks certificate files under `/etc/letsencrypt/live/`.
 - **Email Notifications**: Sends alerts to a master email address and optional domain-specific recipients when certificates are approaching expiry.
 - **Customisable Settings**: Allows global and per-domain configurations for warning thresholds and follow-up intervals.
 - **`Systemd` Integration**: Utilises `systemd` timers to schedule regular checks and follow-up reminders.
@@ -29,24 +29,28 @@ This script automates the monitoring of SSL certificates by checking their expir
 
 - Operating System: Linux-based system with `systemd` support.
 - Dependencies:
-	- `bash`
+	- Bash 4 or later
 	- `openssl`
 	- `sendmail`
 	- `systemd` (`systemd-run`, `systemctl`, and `systemd-analyze`)
-	- `flock` (util-linux), `sha256sum`, `date`, `mktemp`, and `sed`
+	- `flock` (util-linux), GNU coreutils (`sha256sum`, `stat`, `realpath`, `date`, and `mktemp`), and `sed`
 
 `systemd-analyze timespan` is required for regular follow-up intervals. It is available in upstream systemd 240 and later, or in older distribution versions that backport it. Check with `systemd-analyze timespan 24h` before upgrading; without it, regular follow-ups cannot be scheduled.
 
 ## Installation
 
-The paths below use `/usr/local/bin/SSL_Expiry_Reminder.sh` as an example. If you choose another location, use its absolute path throughout the installation and set `SCRIPT_PATH` in the script to the same path. The systemd service's `ExecStart` must point to that file as well.
+The paths below use `/usr/local/bin/SSL_Expiry_Reminder.sh` as an example. If you choose another location, use its absolute path throughout the installation and in the systemd service's `ExecStart`.
+
+The service runs with administrator privileges. Anyone who can modify or replace the script can therefore execute code with those privileges. For a more secure installation, consider a root-owned script in a location where untrusted users cannot modify the file or its parent directories, including paths reached through symbolic links. For example, a user-writable home directory allows its owner to replace the script even if the file itself is owned by root. Choose a location appropriate for your server and who can access it.
 
 1. Download the Script:
 	- Save the script as `/usr/local/bin/SSL_Expiry_Reminder.sh`
 1. Make the Script Executable:
-	```bash
+	```sh
 	sudo chmod +x /usr/local/bin/SSL_Expiry_Reminder.sh
 	```
+1. Configure the Script:
+	- Set your email addresses and any desired warning and follow-up settings as described in [Configuration](#configuration). Replace or remove the example domain groups.
 1. Create `Systemd` Service File:
 	- Path: `/usr/lib/systemd/system/SSL-Expiry.service`
 	- Content:
@@ -62,19 +66,20 @@ The paths below use `/usr/local/bin/SSL_Expiry_Reminder.sh` as an example. If yo
 1. Create Systemd Timer File:
 	- Path: `/usr/lib/systemd/system/SSL-Expiry.timer`
 	- Content:
-		```bash
+		```ini
 		[Unit]
 		Description=Runs the SSL Expiry Reminder Script Daily
 
 		[Timer]
-		OnCalendar=*-*-* 00:00:00 # Runs daily at midnight
+		# Runs daily at midnight
+		OnCalendar=*-*-* 00:00:00
 		Persistent=true
 
 		[Install]
 		WantedBy=timers.target
 		```
 1. Enable and Start the Timer:
-	```bash
+	```sh
 	sudo systemctl daemon-reload && sudo systemctl enable SSL-Expiry.timer && sudo systemctl start SSL-Expiry.timer
 	```
 
@@ -86,21 +91,29 @@ Edit the `/usr/local/bin/SSL_Expiry_Reminder.sh` script to customise the followi
 	- `MASTER_WARNING_DAYS`: Default number of days before expiry to trigger a reminder.
 	- `MASTER_FOLLOW_UP_INTERVAL`: Default interval for follow-up reminders (e. g., “24h” for daily).
 	- `SENDER_EMAIL`: Sender email address for reminders.
-	- `SCRIPT_PATH`: Absolute path to the installed script; scheduled reminders use this path. It must match the service's `ExecStart` path.
-- Per-Domain Custom Settings (Optional):
-	- `EMAILS["yourdomain.com"]`: Additional email recipients for specific domains.
-	- `WARNING_DAYS["yourdomain.com"]`: Custom warning thresholds for specific domains.
-	- `FOLLOW_UP_INTERVALS["yourdomain.com"]`: Custom follow-up intervals for specific domains.
 
-Set an interval to an empty string to disable follow-ups. An explicitly empty `FOLLOW_UP_INTERVALS["domain"]` disables them for that domain, even when the master interval is set. If the master interval is empty, domains with a non-empty override still receive follow-ups. Use a positive systemd time span such as `11h` or `1h30m`. Failed initial warnings are retried even when follow-ups are disabled.
+For optional per-domain settings, add a `configure_domains` line for one or more certificate names. Each name is the directory name under `/etc/letsencrypt/live/`:
+
+```sh
+sudo ls -1 /etc/letsencrypt/live/
+```
+
+```sh
+configure_domains "Domain Admin <team@example.com>" 10 "11h" \
+    example.com www.example.com shop.example.com
+```
+
+The arguments are the additional recipient, the warning threshold in **days**, the follow-up interval, and one or more certificate names. Each name refers to a certificate directory, not necessarily every domain covered by that certificate. All names in the group share those settings. The master recipient still receives the warning. Use `""` for no additional recipient, or for the default warning threshold. Domains not listed use the master settings. If a domain appears in multiple groups, the last group takes precedence.
+
+Follow-up intervals use systemd time spans: for example, `"30min"`, `"11h"`, `"1d"`, `"2w"`, `"1y"`, or `"1h30m"`. A year is a fixed duration of 365.25 days, not a calendar anniversary. Intervals must be positive and less than one billion seconds (about 31.7 years); fractions of a second are rounded up. An empty interval disables follow-ups for that group, even if the master interval is set. If the master interval is empty, groups with a non-empty interval still receive follow-ups. Failed initial warnings are retried even when follow-ups are disabled.
 
 Ensure that `sendmail` is correctly configured. Run all scheduled and manual invocations as the same privileged user, with access to the certificates and system systemd manager.
 
 ## Usage
 
-The daily `SSL-Expiry.timer` discovers certificates entering their warning period. The first scan sends a warning and, when enabled, schedules a separate transient follow-up timer for each domain. Follow-ups check and notify only their own domain. A daily or manual scan does not send the same warning again merely because another timer ran. A renewed certificate is treated as a new certificate; a certificate outside its warning period has its pending timer cancelled.
+The daily `SSL-Expiry.timer` discovers certificates entering their warning period. When a certificate is first found within its warning period, the scan sends a warning and, when enabled, schedules a separate transient follow-up timer for it. Follow-ups check and notify only their own certificate. A daily or manual scan does not send the same warning again merely because another timer ran. A renewed certificate is treated as a new certificate; a certificate outside its warning period has its pending timer cancelled.
 
-The script keeps reminder history under `/var/lib/ssl-expiry-reminder/`. Keep this directory private and persistent: removing it may cause another initial warning. After a reboot, the next daily or manual scan attempts to send one overdue reminder or schedules it for its original due time. Multiple missed reminders are not sent. Reminders may be delayed by systemd or by the time the script takes to run. Changes to follow-up intervals take effect at the next scan or follow-up; a pending retry keeps its existing schedule.
+The script keeps reminder history under `/var/lib/ssl-expiry-reminder/`. Keep this directory private and persistent: removing it may cause another initial warning. The directory must belong to the user running the script and must not grant group or other users access; the script refuses to run if it is unsafe. After a reboot, the next daily or manual scan attempts to send one overdue reminder or schedules it for its original due time. Multiple missed reminders are not sent. Reminders may be delayed by systemd or by the time the script takes to run. Changes to follow-up intervals take effect at the next scan or follow-up; a pending retry keeps its existing schedule.
 
 If a message cannot be submitted to the local mail system, the script retries after 15 minutes, then 30 minutes, one hour, two hours and, thereafter, every four hours. It continues after expiry while the certificate remains present and within the warning period. Once the message is accepted, the normal follow-up schedule resumes. Acceptance by the local mail system does not guarantee delivery to the recipient.
 
@@ -115,23 +128,25 @@ Inspect follow-up timers and their logs with:
 
 ```sh
 systemctl list-timers --all 'ssl-expiry-followup-*'
-journalctl -u 'ssl-expiry-followup-*'
+sudo journalctl -u 'ssl-expiry-followup-*'
 ```
 
 ### Upgrade and stopping reminders
 
-Before replacing the script, save your email addresses, warning thresholds and follow-up intervals. Copy them into the new script after upgrading.
+Before replacing the script, save your email addresses, warning thresholds and follow-up intervals. Copy them into the new script after upgrading. Check its ownership and permissions as described under Installation.
 
-After upgrading from the original version, stop the old shared follow-up timer once, then run a scan to establish the new per-domain timers:
+If you choose to move the script, install the new copy at the chosen location and update the service's `ExecStart` path. Follow-up timers use the resolved path of the script at the time they are created, even if it was started through a symbolic link. Existing timers therefore still point to the old file if you move it or change the link. Keep the old copy in place until you have recreated them:
 
 ```sh
-sudo systemctl stop ssl-expiry-followup.timer
-sudo /usr/local/bin/SSL_Expiry_Reminder.sh
+sudo systemctl daemon-reload
+sudo systemctl stop 'ssl-expiry-followup-*.timer'
+sudo systemctl start SSL-Expiry.service
+sudo systemctl list-timers --all 'ssl-expiry-followup-*'
 ```
 
-If the old timer is absent, systemd may report that it could not be found. The new scan does not require the old timer to exist. To disable follow-ups, set the master interval and any domain overrides to empty strings, then run a scan so pending regular follow-up timers are cancelled. Retries of failed mail submissions remain active. The daily timer continues to detect newly expiring or renewed certificates. To stop automatic discovery too, run `sudo systemctl disable --now SSL-Expiry.timer`.
+After checking that the scan succeeded and any expected follow-up timers have been recreated, you can remove the old copy. A reminder that was already due may be sent during the scan.
 
-When upgrading from the earlier per-domain timer version, existing reminders keep their schedule if their timers are still running. If a timer has already been lost, a fresh interval starts at the next scan. Reminders scheduled by the new version retain their due times across restarts.
+To disable follow-ups, set the master interval and any group intervals to empty strings, then run a scan so pending regular follow-up timers are cancelled. Retries of failed mail submissions remain active. The daily timer continues to detect newly expiring or renewed certificates. To stop automatic discovery too, run `sudo systemctl disable --now SSL-Expiry.timer`.
 
 ## Troubleshooting
 

@@ -1,17 +1,17 @@
 #!/bin/bash
-#
+
 # Let’s Encrypt SSL Certificate Expiry Reminder Service 1.0
-#
+
 # Author:
 # Name: Marco Steinbrecher
 # Email: lesslscript@steinbrecher.co
 # GitHub: https://github.com/macsteini/SSL-Expiry-Reminder-Service
-#
+
 # Description:
 # This script checks all Let’s Encrypt SSL certificates on the server
 # and sends email reminders when a certificate is nearing expiry.
 # It also schedules follow-up reminders if necessary.
-#
+
 # Features:
 # - Sends reminders to a master admin email for all domains.
 # - Supports additional email recipients per domain.
@@ -19,21 +19,22 @@
 # settings.
 # - Configurable follow-up intervals to send repeated reminders.
 # - Uses the systemd-run command to schedule follow-up reminders.
-#
+
 # How to Use:
 # - Update MASTER_EMAIL with your admin email.
 # - Set MASTER_WARNING_DAYS to the default threshold (in days).
 # - Define per-domain custom settings (optional).
 # - Ensure sendmail (or another MTA) is configured to send emails.
-#
-# Follow-up intervals use systemd time spans, for example "24h", "11h",
-# or "1h30m". An empty master interval disables follow-ups by default;
+
+# Follow-up intervals use systemd time spans, for example "30min", "11h",
+# "1d", "2w", "1y", or "1h30m". Warning thresholds are always in days.
+# An empty master interval disables follow-ups by default;
 # an explicitly empty domain override disables them for that domain.
 # A daily scan discovers expiring certificates and reconciles timers.
 # Each enabled domain has its own transient follow-up timer and a saved
 # certificate fingerprint, so unrelated scans do not resend its warning.
 # See the README for installation, state, upgrade, and recovery details.
-#
+
 # MIT Licence:
 # Permission is hereby granted, free of charge, to any person obtaining
 # a copy of this software and associated documentation files (the
@@ -42,10 +43,10 @@
 # distribute, sublicense, and/or sell copies of the Software, and to
 # permit persons to whom the Software is furnished to do so, subject to
 # the following conditions:
-#
+
 # The above copyright notice and this permission notice shall be
 # included in all copies or substantial portions of the Software.
-#
+
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
 # EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
 # MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
@@ -59,40 +60,56 @@ MASTER_EMAIL="Domain Admin <admin@example.com>" # Primary email to receive all e
 MASTER_WARNING_DAYS=14 # Default number of days before expiry to trigger a reminder
 MASTER_FOLLOW_UP_INTERVAL="24h" # Default interval for follow-up reminders (e. g., "24h" for daily)
 SENDER_EMAIL="Let’s Encrypt SSL Expiry Service <noreply@example.com>" # Sender email address for reminders
-SCRIPT_PATH="/usr/local/bin/SSL_Expiry_Reminder.sh" # Absolute path to this script, used for scheduled reminders
 
 # ----------------------------------------------------------------------
 # Per-Domain Custom Settings (Optional)
 # ----------------------------------------------------------------------
-# Define specific recipients, warning thresholds, and follow-up
-# intervals for individual domains. If a domain is not explicitly
-# listed, it will fall back to the master settings.
+# Use configure_domains to apply the same settings to one or more domains.
+# Arguments: additional email, warning days, follow-up interval, then domains.
+# Warning days is a number of days; interval examples include "30min", "11h",
+# "1d", "2w", "1y", and "1h30m". Quote intervals containing spaces.
+# Intervals must be positive and shorter than one billion seconds (~31.7 years).
+# Use "" for no additional recipient, or for the default warning days.
+# An empty follow-up interval disables follow-ups for those domains.
+# Domains without a configuration use the master settings. If a domain is
+# listed more than once, the last configuration takes precedence.
 
 declare -A EMAILS # Stores additional email recipients per domain.
 declare -A WARNING_DAYS # Stores custom warning thresholds per domain.
 declare -A FOLLOW_UP_INTERVALS # Stores custom follow-up intervals per domain.
 
-# Configurations for individual domains (add as many as required):
-EMAILS["yourdomain1.com"]="Domain Admin <user1@example.com>"
-WARNING_DAYS["yourdomain1.com"]=10
-FOLLOW_UP_INTERVALS["yourdomain1.com"]="11h"
+configure_domains() {
+    if [ "$#" -lt 4 ]; then
+        echo "configure_domains requires an email, warning days, interval and at least one domain" >&2
+        exit 1
+    fi
+    local email=$1 warning_days=$2 interval=$3 domain
+    shift 3
+    for domain in "$@"; do
+        EMAILS["$domain"]=$email
+        WARNING_DAYS["$domain"]=$warning_days
+        FOLLOW_UP_INTERVALS["$domain"]=$interval
+    done
+}
 
-EMAILS["yourdomain2.com"]="Domain Admin <user2@example.com>"
-WARNING_DAYS["yourdomain2.com"]=2
-FOLLOW_UP_INTERVALS["yourdomain2.com"]="24h"
+# Add as many groups as needed. Each domain in a group gets the same settings.
+configure_domains "Domain Admin <user1@example.com>" 10 "11h" \
+    yourdomain1.com
+configure_domains "Domain Admin <user2@example.com>" 2 "24h" \
+    yourdomain2.com
 
 # ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️
 # FROM THIS POINT ONWARDS, DO NOT MODIFY ANYTHING
 # UNLESS YOU KNOW WHAT YOU ARE DOING!
 # ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️
-#
+
 # The following section is part of the script's internal logic.
 # - DO NOT change any variables here unless you fully understand the
 # implications.
 # - Modifying these values incorrectly may break the script or cause
 # incorrect behaviour.
 # - The script will handle follow-ups and expiry checks automatically.
-#
+
 # If you need to change settings, do so in the CONFIGURATION section at
 # the top of the script.
 
@@ -100,9 +117,32 @@ FOLLOW_UP_INTERVALS["yourdomain2.com"]="24h"
 # manual runs, and transient follow-up services.
 STATE_DIR=/var/lib/ssl-expiry-reminder
 CERT_DIR=/etc/letsencrypt/live
+# Follow-ups must execute the same file, even when invoked through a relative
+# path or a symbolic link. Resolve it before creating any timer.
+SCRIPT_PATH=$(realpath -e -- "${BASH_SOURCE[0]}") || {
+    echo "Cannot determine the script path" >&2
+    exit 1
+}
 umask 077
 mkdir -p "$STATE_DIR" || exit 1
-exec 9>"$STATE_DIR/lock" || exit 1
+# The lock is opened with elevated privileges. Never follow links or trust a
+# directory that another user could alter between the checks and the open.
+if [ -L "$STATE_DIR" ] || [ ! -d "$STATE_DIR" ]; then
+    echo "Unsafe state directory: $STATE_DIR" >&2
+    exit 1
+fi
+STATE_METADATA=$(stat -c '%u %a' -- "$STATE_DIR") || exit 1
+read -r STATE_OWNER STATE_MODE <<< "$STATE_METADATA"
+case "$STATE_MODE" in ''|*[!0-7]*|?????*) echo "Invalid state directory permissions: $STATE_DIR" >&2; exit 1 ;; esac
+if [ "$STATE_OWNER" != "$EUID" ] || (( (8#$STATE_MODE & 077) != 0 )); then
+    echo "Unsafe state directory owner or permissions: $STATE_DIR" >&2
+    exit 1
+fi
+if [ -L "$STATE_DIR/lock" ] || { [ -e "$STATE_DIR/lock" ] && [ ! -f "$STATE_DIR/lock" ]; }; then
+    echo "Unsafe lock file: $STATE_DIR/lock" >&2
+    exit 1
+fi
+exec 9>>"$STATE_DIR/lock" || exit 1
 flock -x 9 || exit 1
 
 MODE=scan
@@ -117,7 +157,6 @@ if [ "$#" -ne 0 ]; then
 fi
 
 # State: fingerprint, interval, pending unit, domain, due epoch, retry stage.
-# Four-line state files from earlier versions are accepted.
 # The unit name is a token as well: stale timer invocations cannot send mail.
 write_state() {
     local tmp
@@ -182,7 +221,7 @@ process_domain() {
     local DOMAIN=$1 DOMAIN_HASH STATE_FILE CERT_INFO EXPIRY_DATE EXPIRY_TIMESTAMP
     local CURRENT_TIMESTAMP DAYS_LEFT DOMAIN_WARNING_DAYS NEW_FINGERPRINT
     local FINGERPRINT='' INTERVAL='' UNIT='' SAVED_DOMAIN='' OLD_INTERVAL='' EMAIL
-    local DUE='' RETRY=0 SECONDS_INTERVAL=0 LEGACY=0 MAIL_FAILED=0
+    local DUE='' RETRY=0 SECONDS_INTERVAL=0 MAIL_FAILED=0
     local -a RECIPIENTS
     case "$DOMAIN" in
         ''|*[!a-zA-Z0-9._-]*|.|..) echo "Invalid domain directory: $DOMAIN" >&2; return 1 ;;
@@ -193,17 +232,21 @@ process_domain() {
     if [ -f "$STATE_FILE" ]; then
         {
             if ! { IFS= read -r FINGERPRINT && IFS= read -r OLD_INTERVAL &&
-                IFS= read -r UNIT && IFS= read -r SAVED_DOMAIN; }; then
+                IFS= read -r UNIT && IFS= read -r SAVED_DOMAIN &&
+                IFS= read -r DUE && IFS= read -r RETRY; }; then
                 echo "Invalid state for $DOMAIN" >&2; return 1;
-            fi
-            if ! IFS= read -r DUE; then
-                LEGACY=1
-                DUE=
-            else
-                IFS= read -r RETRY || { echo "Invalid state for $DOMAIN" >&2; return 1; }
             fi
         } < "$STATE_FILE"
         [ "$SAVED_DOMAIN" = "$DOMAIN" ] || { echo "State mismatch for $DOMAIN" >&2; return 1; }
+        if [ -n "$UNIT" ]; then
+            case "$UNIT" in
+                "ssl-expiry-followup-$DOMAIN_HASH-"*)
+                    local unit_token=${UNIT#"ssl-expiry-followup-$DOMAIN_HASH-"}
+                    case "$unit_token" in ''|*[!a-zA-Z0-9]*) echo "Invalid timer for $DOMAIN" >&2; return 1 ;; esac
+                    ;;
+                *) echo "Invalid timer for $DOMAIN" >&2; return 1 ;;
+            esac
+        fi
         case "$DUE" in ''|*[!0-9]*) [ -z "$DUE" ] || { echo "Invalid due time for $DOMAIN" >&2; return 1; } ;; esac
         case "$RETRY" in 0|1|2|3|4|5) ;; *) echo "Invalid retry stage for $DOMAIN" >&2; return 1 ;; esac
 
@@ -240,29 +283,13 @@ process_domain() {
         FINGERPRINT=
         DUE=
         RETRY=0
-        LEGACY=0
     elif [ "$OLD_INTERVAL" != "$INTERVAL" ]; then
         # A pending retry is independent of the normal follow-up interval.
         if [ "$RETRY" -eq 0 ]; then
             cancel_timer || return 1
             set_followup_due || { write_state; return 1; }
-            LEGACY=0
         fi
         write_state || return 1
-    fi
-
-    # Old state has no due time. Keep its live timer; if it was lost,
-    # establish a fresh interval. A valid old callback remains deliverable.
-    if [ "$LEGACY" -eq 1 ] && [ -n "$FINGERPRINT" ]; then
-        if [ "$MODE" = follow-up ] && [ -n "$UNIT" ]; then
-            DUE=$CURRENT_TIMESTAMP
-        elif [ -n "$UNIT" ] && systemctl is-active --quiet "$UNIT.timer"; then
-            return 0
-        else
-            UNIT=
-            set_followup_due || { write_state; return 1; }
-            write_state || return 1
-        fi
     fi
 
     if [ -z "$FINGERPRINT" ] || { [ -n "$DUE" ] && [ "$CURRENT_TIMESTAMP" -ge "$DUE" ]; }; then
