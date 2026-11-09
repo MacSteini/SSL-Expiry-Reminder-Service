@@ -32,8 +32,10 @@ This script automates the monitoring of SSL certificates by checking their expir
 	- `bash`
 	- `openssl`
 	- `sendmail`
-	- `systemd` (`systemd-run` and `systemctl`)
+	- `systemd` (`systemd-run`, `systemctl`, and `systemd-analyze`)
 	- `flock` (util-linux), `sha256sum`, `date`, `mktemp`, and `sed`
+
+`systemd-analyze timespan` is required for regular follow-up intervals. It is available in upstream systemd 240 and later, or in older distribution versions that backport it. Check with `systemd-analyze timespan 24h` before upgrading; without it, regular follow-ups cannot be scheduled.
 
 ## Installation
 
@@ -87,7 +89,7 @@ Edit the `/usr/local/bin/SSL_Expiry_Reminder.sh` script to customise the followi
 	- `WARNING_DAYS["yourdomain.com"]`: Custom warning thresholds for specific domains.
 	- `FOLLOW_UP_INTERVALS["yourdomain.com"]`: Custom follow-up intervals for specific domains.
 
-Set an interval to an empty string to disable follow-ups. An explicitly empty `FOLLOW_UP_INTERVALS["domain"]` disables them for that domain, even when the master interval is set. If the master interval is empty, domains with a non-empty override still receive follow-ups. Non-empty intervals are systemd time spans such as `11h` or `1h30m`.
+Set an interval to an empty string to disable follow-ups. An explicitly empty `FOLLOW_UP_INTERVALS["domain"]` disables them for that domain, even when the master interval is set. If the master interval is empty, domains with a non-empty override still receive follow-ups. Use a positive systemd time span such as `11h` or `1h30m`. Failed initial warnings are retried even when follow-ups are disabled.
 
 Ensure that `sendmail` is correctly configured. Run all scheduled and manual invocations as the same privileged user, with access to the certificates and system systemd manager.
 
@@ -95,7 +97,9 @@ Ensure that `sendmail` is correctly configured. Run all scheduled and manual inv
 
 The daily `SSL-Expiry.timer` discovers certificates entering their warning period. The first scan sends a warning and, when enabled, schedules a separate transient follow-up timer for each domain. Follow-ups check and notify only their own domain. A daily or manual scan does not send the same warning again merely because another timer ran. A renewed certificate is treated as a new certificate; a certificate outside its warning period has its pending timer cancelled.
 
-The script stores fingerprints and pending timer identifiers under `/var/lib/ssl-expiry-reminder/` and uses `flock` to serialise scans and follow-ups. Keep this directory private and persistent. Removing it loses the reminder history and may cause another initial warning. After a reboot, transient timers are recreated by the next daily or manual scan, starting a fresh interval; missed follow-ups are not replayed. Changed intervals are applied on the next scan or follow-up. Systemd timer accuracy and service execution time may delay a reminder.
+The script keeps reminder history under `/var/lib/ssl-expiry-reminder/`. Keep this directory private and persistent: removing it may cause another initial warning. After a reboot, the next daily or manual scan attempts to send one overdue reminder or schedules it for its original due time. Multiple missed reminders are not sent. Reminders may be delayed by systemd or by the time the script takes to run. Changes to follow-up intervals take effect at the next scan or follow-up; a pending retry keeps its existing schedule.
+
+If a message cannot be submitted to the local mail system, the script retries after 15 minutes, then 30 minutes, one hour, two hours and, thereafter, every four hours. It continues after expiry while the certificate remains present and within the warning period. Once the message is accepted, the normal follow-up schedule resumes. Acceptance by the local mail system does not guarantee delivery to the recipient.
 
 Run a scan manually or inspect the daily timer:
 
@@ -113,6 +117,8 @@ journalctl -u 'ssl-expiry-followup-*'
 
 ### Upgrade and stopping reminders
 
+Before replacing the script, save your email addresses, warning thresholds and follow-up intervals. Copy them into the new script after upgrading.
+
 After upgrading from the original version, stop the old shared follow-up timer once, then run a scan to establish the new per-domain timers:
 
 ```sh
@@ -120,11 +126,13 @@ sudo systemctl stop ssl-expiry-followup.timer
 sudo /usr/local/bin/SSL_Expiry_Reminder.sh
 ```
 
-If the old timer is absent, systemd may report that it could not be found. The new scan does not require the old timer to exist. To disable follow-ups, set the master interval and any domain overrides to empty strings, then run a scan so pending timers are cancelled. The daily timer continues to detect newly expiring or renewed certificates. To stop automatic discovery too, run `sudo systemctl disable --now SSL-Expiry.timer`.
+If the old timer is absent, systemd may report that it could not be found. The new scan does not require the old timer to exist. To disable follow-ups, set the master interval and any domain overrides to empty strings, then run a scan so pending regular follow-up timers are cancelled. Retries of failed mail submissions remain active. The daily timer continues to detect newly expiring or renewed certificates. To stop automatic discovery too, run `sudo systemctl disable --now SSL-Expiry.timer`.
+
+When upgrading from the earlier per-domain timer version, existing reminders keep their schedule if their timers are still running. If a timer has already been lost, a fresh interval starts at the next scan. Reminders scheduled by the new version retain their due times across restarts.
 
 ## Troubleshooting
 
-If scheduling or mail delivery fails, the script exits unsuccessfully and reports the affected domain. Check the service journal and correct the problem. A later daily or manual scan retries missing timers; failed mail delivery may need another scan. If delivery succeeds for some recipients but fails for others, a retry may repeat mail to the successful recipients. A crash after mail is accepted but before the state is saved can also lead to a repeated warning.
+If scheduling or mail submission fails, the script exits unsuccessfully and reports the affected domain. Check the service journal and correct the problem. A later daily or manual scan recovers missing timers or processes overdue reminders. If submission succeeds for some recipients but fails for others, a retry may repeat mail to the successful recipients. A crash after mail is accepted but before the state is saved can also lead to a repeated warning.
 
 ## Contributing
 Contributions are welcome! Please follow these steps:

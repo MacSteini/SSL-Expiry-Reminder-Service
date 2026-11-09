@@ -116,12 +116,13 @@ if [ "$#" -ne 0 ]; then
     REQUEST_UNIT=$3
 fi
 
-# State is four lines: fingerprint, configured interval, pending unit, domain.
+# State: fingerprint, interval, pending unit, domain, due epoch, retry stage.
+# Four-line state files from earlier versions are accepted.
 # The unit name is a token as well: stale timer invocations cannot send mail.
 write_state() {
     local tmp
     tmp=$(mktemp "$STATE_DIR/state.XXXXXXXXXX") || return 1
-    if ! printf '%s\n' "$FINGERPRINT" "$INTERVAL" "$UNIT" "$DOMAIN" > "$tmp" || ! mv -f "$tmp" "$STATE_FILE"; then
+    if ! printf '%s\n' "$FINGERPRINT" "$INTERVAL" "$UNIT" "$DOMAIN" "$DUE" "$RETRY" > "$tmp" || ! mv -f "$tmp" "$STATE_FILE"; then
         rm -f "$tmp"
         return 1
     fi
@@ -134,29 +135,54 @@ cancel_timer() {
     UNIT=
 }
 
+# Convert a systemd time span to whole seconds, rounding up. Reject zero,
+# infinity and values too large for safe arithmetic.
+interval_seconds() {
+    local output microseconds
+    output=$(LC_ALL=C systemd-analyze timespan "$1") || {
+        echo "Cannot parse interval: check systemd-analyze timespan support and configuration" >&2
+        return 1
+    }
+    microseconds=$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*.*s:[[:space:]]*\([0-9][0-9]*\)$/\1/p')
+    case "$microseconds" in ''|*[!0-9]*|????????????????*) return 1 ;; esac
+    [ "$microseconds" -gt 0 ] || return 1
+    SECONDS_INTERVAL=$(((microseconds + 999999) / 1000000))
+}
+
 schedule_timer() {
-    local token_file token new_unit
-    [ -n "$INTERVAL" ] || return 0
+    local token_file token delay
+    [ -n "$DUE" ] || return 0
+    delay=$((DUE - CURRENT_TIMESTAMP))
+    [ "$delay" -gt 0 ] || delay=1
     token_file=$(mktemp "$STATE_DIR/timer.XXXXXXXXXX") || return 1
     token=${token_file##*.}
     rm -f "$token_file" || return 1
-    new_unit="ssl-expiry-followup-$DOMAIN_HASH-$token"
-    # Persist the token before creating the timer. A failed creation is
-    # retried by the next scan; a stale callback cannot match a new token.
-    UNIT=$new_unit
+    UNIT="ssl-expiry-followup-$DOMAIN_HASH-$token"
+    # Save before creating the timer so obsolete callbacks cannot match.
     write_state || return 1
-    if ! systemd-run --on-active="$INTERVAL" --unit="$UNIT" "$SCRIPT_PATH" --follow-up "$DOMAIN" "$UNIT"; then
-        echo "Failed to schedule follow-up for $DOMAIN" >&2
+    if ! systemd-run --on-active="${delay}s" --unit="$UNIT" "$SCRIPT_PATH" --follow-up "$DOMAIN" "$UNIT"; then
+        echo "Failed to schedule reminder for $DOMAIN" >&2
         UNIT=
         write_state || return 1
         return 1
     fi
 }
 
+set_followup_due() {
+    DUE=
+    [ -n "$INTERVAL" ] || return 0
+    if ! interval_seconds "$INTERVAL"; then
+        echo "Cannot calculate follow-up interval for $DOMAIN: $INTERVAL" >&2
+        return 1
+    fi
+    DUE=$((CURRENT_TIMESTAMP + SECONDS_INTERVAL))
+}
+
 process_domain() {
     local DOMAIN=$1 DOMAIN_HASH STATE_FILE CERT_INFO EXPIRY_DATE EXPIRY_TIMESTAMP
     local CURRENT_TIMESTAMP DAYS_LEFT DOMAIN_WARNING_DAYS NEW_FINGERPRINT
     local FINGERPRINT='' INTERVAL='' UNIT='' SAVED_DOMAIN='' OLD_INTERVAL='' EMAIL
+    local DUE='' RETRY=0 SECONDS_INTERVAL=0 LEGACY=0 MAIL_FAILED=0
     local -a RECIPIENTS
     case "$DOMAIN" in
         ''|*[!a-zA-Z0-9._-]*|.|..) echo "Invalid domain directory: $DOMAIN" >&2; return 1 ;;
@@ -165,10 +191,22 @@ process_domain() {
     DOMAIN_HASH=${DOMAIN_HASH%% *}
     STATE_FILE="$STATE_DIR/$DOMAIN_HASH"
     if [ -f "$STATE_FILE" ]; then
-        { IFS= read -r FINGERPRINT && IFS= read -r OLD_INTERVAL && IFS= read -r UNIT && IFS= read -r SAVED_DOMAIN; } < "$STATE_FILE" || {
-            echo "Invalid state for $DOMAIN" >&2; return 1;
-        }
+        {
+            if ! { IFS= read -r FINGERPRINT && IFS= read -r OLD_INTERVAL &&
+                IFS= read -r UNIT && IFS= read -r SAVED_DOMAIN; }; then
+                echo "Invalid state for $DOMAIN" >&2; return 1;
+            fi
+            if ! IFS= read -r DUE; then
+                LEGACY=1
+                DUE=
+            else
+                IFS= read -r RETRY || { echo "Invalid state for $DOMAIN" >&2; return 1; }
+            fi
+        } < "$STATE_FILE"
         [ "$SAVED_DOMAIN" = "$DOMAIN" ] || { echo "State mismatch for $DOMAIN" >&2; return 1; }
+        case "$DUE" in ''|*[!0-9]*) [ -z "$DUE" ] || { echo "Invalid due time for $DOMAIN" >&2; return 1; } ;; esac
+        case "$RETRY" in 0|1|2|3|4|5) ;; *) echo "Invalid retry stage for $DOMAIN" >&2; return 1 ;; esac
+
     fi
     # An explicitly empty override differs from an absent array entry.
     INTERVAL=${FOLLOW_UP_INTERVALS[$DOMAIN]-$MASTER_FOLLOW_UP_INTERVAL}
@@ -200,13 +238,35 @@ process_domain() {
     if [ "$FINGERPRINT" != "$NEW_FINGERPRINT" ]; then
         cancel_timer || return 1
         FINGERPRINT=
+        DUE=
+        RETRY=0
+        LEGACY=0
     elif [ "$OLD_INTERVAL" != "$INTERVAL" ]; then
-        cancel_timer || return 1
+        # A pending retry is independent of the normal follow-up interval.
+        if [ "$RETRY" -eq 0 ]; then
+            cancel_timer || return 1
+            set_followup_due || { write_state; return 1; }
+            LEGACY=0
+        fi
         write_state || return 1
-        # A callback for a newly disabled or changed interval is stale.
-        [ "$MODE" != follow-up ] || { schedule_timer; return $?; }
     fi
-    if [ -z "$FINGERPRINT" ] || [ "$MODE" = follow-up ]; then
+
+    # Old state has no due time. Keep its live timer; if it was lost,
+    # establish a fresh interval. A valid old callback remains deliverable.
+    if [ "$LEGACY" -eq 1 ] && [ -n "$FINGERPRINT" ]; then
+        if [ "$MODE" = follow-up ] && [ -n "$UNIT" ]; then
+            DUE=$CURRENT_TIMESTAMP
+        elif [ -n "$UNIT" ] && systemctl is-active --quiet "$UNIT.timer"; then
+            return 0
+        else
+            UNIT=
+            set_followup_due || { write_state; return 1; }
+            write_state || return 1
+        fi
+    fi
+
+    if [ -z "$FINGERPRINT" ] || { [ -n "$DUE" ] && [ "$CURRENT_TIMESTAMP" -ge "$DUE" ]; }; then
+        cancel_timer || return 1
         RECIPIENTS=("$MASTER_EMAIL")
         if [ -n "${EMAILS[$DOMAIN]}" ] && [ "${EMAILS[$DOMAIN]}" != "$MASTER_EMAIL" ]; then
             RECIPIENTS+=("${EMAILS[$DOMAIN]}")
@@ -214,21 +274,46 @@ process_domain() {
         for EMAIL in "${RECIPIENTS[@]}"; do
             if ! printf 'From: %s\nTo: %s\nSubject: SSL Certificate Expiry Warning for %s\n\nThe SSL certificate for %s expires in %s days.\n\nConsider renewing it soon to avoid downtime.\n' "$SENDER_EMAIL" "$EMAIL" "$DOMAIN" "$DOMAIN" "$DAYS_LEFT" | sendmail -t; then
                 echo "Failed to send warning for $DOMAIN" >&2
-                return 1
+                MAIL_FAILED=1
+                break
             fi
         done
+        CURRENT_TIMESTAMP=$(date +%s) || return 1
         FINGERPRINT=$NEW_FINGERPRINT
-        UNIT=
-        write_state || return 1
-    fi
-    if [ -n "$INTERVAL" ]; then
-        if [ -z "$UNIT" ] || ! systemctl is-active --quiet "$UNIT.timer"; then
+        if [ "$MAIL_FAILED" -eq 1 ]; then
+            [ "$RETRY" -ge 5 ] || RETRY=$((RETRY + 1))
+            case "$RETRY" in
+                1) SECONDS_INTERVAL=900 ;;
+                2) SECONDS_INTERVAL=1800 ;;
+                3) SECONDS_INTERVAL=3600 ;;
+                4) SECONDS_INTERVAL=7200 ;;
+                5) SECONDS_INTERVAL=14400 ;;
+            esac
+            DUE=$((CURRENT_TIMESTAMP + SECONDS_INTERVAL))
+            write_state || return 1
             schedule_timer || return 1
+            return 1
         fi
-    elif [ -n "$UNIT" ]; then
-        cancel_timer || return 1
+        RETRY=0
+        # Record successful delivery before parsing/scheduling the next timer.
+        DUE=
         write_state || return 1
+        set_followup_due || return 1
+        write_state || return 1
+    elif [ "$MODE" = follow-up ]; then
+        # An early timer must be replaced for the remaining duration.
+        UNIT=
     fi
+
+    if [ -n "$DUE" ] && { [ -z "$UNIT" ] || ! systemctl is-active --quiet "$UNIT.timer"; }; then
+        schedule_timer || return 1
+    elif [ -z "$DUE" ] && [ -n "$INTERVAL" ] && [ "$RETRY" -eq 0 ]; then
+        # Recover from an interval parsing or scheduling failure after mail.
+        set_followup_due || return 1
+        write_state || return 1
+        schedule_timer || return 1
+    fi
+
 }
 
 STATUS=0
